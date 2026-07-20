@@ -30,6 +30,24 @@ def test_parse_tegrastats_memory_gpu_temperature_and_power() -> None:
     assert snapshot.power_rails["SYS5V"] == {"instant_mw": 1458, "average_mw": 1400}
 
 
+def test_parse_tegrastats_power_rails_with_mw_suffix() -> None:
+    output = (
+        "RAM 4220/30687MB (lfb 5732x4MB) SWAP 0/15343MB (cached 0MB) "
+        "CPU [1%@729,0%@729,0%@729,0%@729] GR3D_FREQ 0%@306 "
+        "CPU@41.5C GPU@40.5C SOC2@39.5C CV0@38.5C "
+        "VDD_GPU_SOC 716mW/716mW VDD_CPU_CV 238mW/238mW "
+        "VIN_SYS_5V0 2772mW/2772mW"
+    )
+
+    snapshot = parse_tegrastats(output)
+
+    assert snapshot.power_rails == {
+        "VDD_GPU_SOC": {"instant_mw": 716, "average_mw": 716},
+        "VDD_CPU_CV": {"instant_mw": 238, "average_mw": 238},
+        "VIN_SYS_5V0": {"instant_mw": 2772, "average_mw": 2772},
+    }
+
+
 def test_parse_tegrastats_handles_empty_output() -> None:
     snapshot = parse_tegrastats("")
 
@@ -39,4 +57,3 @@ def test_parse_tegrastats_handles_empty_output() -> None:
     assert snapshot.gpu is None
     assert snapshot.temperatures == {}
     assert snapshot.power_rails == {}
-

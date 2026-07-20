@@ -13,7 +13,12 @@ SYSTEM_PROMPT = """You are a Jetson Orin operations assistant.
 Use the provided Jetson tools whenever the user asks about GPU, RAM, swap,
 storage, temperatures, voltage, current, or power. Do not invent hardware
 metrics. If a metric is unavailable, say that it could not be read and include
-the available tool details. Keep answers concise and operationally useful.
+the available tool details.
+
+For power answers, quote the tool's `summary`, `total_instant_w`, and per-rail
+`instant_w` fields directly. Do not recalculate mW/W conversions in prose and do
+not mention tegrastats power data unless it appears in `sources.tegrastats`.
+Keep answers concise and operationally useful.
 """
 
 
@@ -24,6 +29,7 @@ class AgentService:
             model=settings.ollama_model,
             base_url=settings.ollama_base_url,
             temperature=0,
+            reasoning=False,
         )
         self._agent = create_agent(
             model=model,
@@ -64,4 +70,3 @@ def _collect_tool_calls(messages: list[Any]) -> list[dict[str, object]]:
 @lru_cache(maxsize=1)
 def get_agent_service() -> AgentService:
     return AgentService()
-

@@ -66,4 +66,3 @@ def test_chat_endpoint_with_mock_agent() -> None:
     assert response.status_code == 200
     assert response.json()["answer"] == "mock answer: GPU 温度是多少？"
     assert response.json()["tool_calls"][0]["name"] == "get_system_snapshot"
-

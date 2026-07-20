@@ -17,7 +17,10 @@ RAM_RE = re.compile(r"RAM\s+(?P<used>\d+)/(?P<total>\d+)MB")
 SWAP_RE = re.compile(r"SWAP\s+(?P<used>\d+)/(?P<total>\d+)MB(?:\s+\(cached\s+(?P<cached>\d+)MB\))?")
 GR3D_RE = re.compile(r"GR3D_FREQ\s+(?P<load>\d+)%@(?P<freq>\d+)")
 TEMP_RE = re.compile(r"(?P<name>[A-Za-z0-9_]+)@(?P<temp>-?\d+(?:\.\d+)?)C")
-POWER_RE = re.compile(r"(?P<name>[A-Z][A-Z0-9_]+)\s+(?P<instant>\d+)/(?P<average>\d+)")
+POWER_RE = re.compile(
+    r"(?P<name>[A-Z][A-Z0-9_]+)\s+"
+    r"(?P<instant>\d+)(?:mW)?/(?P<average>\d+)(?:mW)?"
+)
 
 
 def parse_tegrastats(output: str) -> TegrastatsSnapshot:
