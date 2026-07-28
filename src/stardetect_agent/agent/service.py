@@ -3,42 +3,74 @@ from typing import Any
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
+from openai import APIConnectionError, APIStatusError
 
 from stardetect_agent.config import get_settings
-from stardetect_agent.jetson.tools import build_jetson_tools
+from stardetect_agent.system.tools import build_system_tools
 
-SYSTEM_PROMPT = """You are a Jetson Orin operations assistant.
+SYSTEM_PROMPT = """You are an operations assistant for an openEuler system with
+a Phytium S5000C CPU and Iluvatar MR-V100 GPU.
 
-Use the provided Jetson tools whenever the user asks about GPU, RAM, swap,
-storage, temperatures, voltage, current, or power. Do not invent hardware
-metrics. If a metric is unavailable, say that it could not be read and include
-the available tool details.
+Use the provided tools whenever the user asks about CPU, GPU, RAM, swap,
+storage, temperature, utilization, or power. CPU, memory, and storage values
+have container scope. GPU values have physical-device scope. State the scope
+when it matters and never describe container values as host values.
 
-For power answers, quote the tool's `summary`, `total_instant_w`, and per-rail
-`instant_w` fields directly. Do not recalculate mW/W conversions in prose and do
-not mention tegrastats power data unless it appears in `sources.tegrastats`.
-Keep answers concise and operationally useful.
+Do not invent hardware metrics. If a metric is unavailable, say so and use the
+tool's reason. In particular, GPU power is unavailable when ixsmi does not
+support a power query; never estimate it from other fields. For GPU utilization,
+prefer the 5-second `utilization_window` average and maximum, and label the
+single `current` value as an instantaneous sample. Keep answers concise and
+operationally useful.
 """
+
+
+class AgentUpstreamError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 class AgentService:
     def __init__(self) -> None:
         settings = get_settings()
-        model = ChatOllama(
-            model=settings.ollama_model,
-            base_url=settings.ollama_base_url,
+        self._llm_base_url = settings.llm_base_url
+        self._llm_model = settings.llm_model
+        model = ChatOpenAI(
+            model=settings.llm_model,
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
             temperature=0,
-            reasoning=False,
+            extra_body={
+                "chat_template_kwargs": {
+                    "enable_thinking": False,
+                }
+            },
         )
         self._agent = create_agent(
             model=model,
-            tools=build_jetson_tools(),
+            tools=build_system_tools(),
             system_prompt=SYSTEM_PROMPT,
         )
 
     def invoke(self, message: str) -> dict[str, Any]:
-        result = self._agent.invoke({"messages": [{"role": "user", "content": message}]})
+        try:
+            result = self._agent.invoke({"messages": [{"role": "user", "content": message}]})
+        except APIConnectionError as exc:
+            raise AgentUpstreamError(
+                "llm_connection_failed",
+                f"Cannot connect to LLM endpoint {self._llm_base_url}",
+            ) from exc
+        except APIStatusError as exc:
+            raise AgentUpstreamError(
+                "llm_request_failed",
+                (
+                    f"LLM model {self._llm_model!r} returned HTTP "
+                    f"{exc.status_code}: {exc.message}"
+                ),
+            ) from exc
         messages = result.get("messages", [])
         answer = _last_ai_content(messages)
         return {"answer": answer, "tool_calls": _collect_tool_calls(messages)}

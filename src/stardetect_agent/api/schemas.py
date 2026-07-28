@@ -3,8 +3,9 @@ from pydantic import BaseModel, Field
 
 class HealthResponse(BaseModel):
     status: str
-    ollama_model: str
-    ollama_base_url: str
+    model_backend: str
+    model: str
+    base_url: str
 
 
 class ChatRequest(BaseModel):
@@ -14,4 +15,3 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     tool_calls: list[dict[str, object]] = Field(default_factory=list)
-

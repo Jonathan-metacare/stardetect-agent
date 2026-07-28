@@ -1,485 +1,361 @@
-# Stardetect Agent Deployment Runbook
+# Build locally, deploy on openEuler
 
-This document explains how to package this project, send it to a Jetson Orin,
-run it on the Orin, and verify the FastAPI -> LangChain -> Ollama -> Jetson
-tools chain.
+## Recommended for this server: upload source and build natively
 
-## 1. What This Agent Runs
+Because the CoreX base image already exists on the AArch64 openEuler server,
+the simplest deployment is to upload the source package and build it there.
+This avoids publishing the CoreX image and avoids cross-compilation.
 
-Target device:
+The source archive does not contain the CoreX image or model files. On the
+server, confirm the existing base image first:
 
-- Jetson Orin
-- Ubuntu 20.04
-- JetPack 5.x / L4T R35.3.1
-- ARM64
-- Python 3.11.15
-- Ollama model: `qwen3.5:4b`
+```bash
+docker image inspect \
+  installer:4.4.0-ubuntu-20.04-py3.10-llm-aarch64-10.2-full
+```
 
-Service chain:
+Extract an uploaded archive into a versioned directory:
+
+```bash
+mkdir -p /opt/stardetect-agent-qwen3-20260728
+
+tar -xzf /tmp/stardetect-agent-corex-4.4.0-qwen3-sampling-20260728.tar.gz \
+  -C /opt/stardetect-agent-qwen3-20260728 \
+  --strip-components=1
+
+cd /opt/stardetect-agent-qwen3-20260728
+```
+
+After enabling vLLM tool calling and creating `stardetect-net` as documented
+below, build and start the Agent:
+
+```bash
+docker build -t stardetect-agent:corex-4.4.0-sampling .
+
+docker run -d \
+  --name stardetect-agent \
+  --restart unless-stopped \
+  --network stardetect-net \
+  --device /dev/iluvatar0:/dev/iluvatar0 \
+  --publish 8001:8001 \
+  --env LLM_BASE_URL=http://llm:8000/v1 \
+  --env LLM_MODEL=qwen3 \
+  --env LLM_API_KEY=dummy \
+  --env IXSMI_PATH=/usr/local/corex-4.4.0/bin/ixsmi \
+  --env IXSMI_TIMEOUT_SECONDS=5 \
+  --env GPU_SAMPLING_INTERVAL_SECONDS=0.2 \
+  --env GPU_SAMPLING_WINDOW_SECONDS=5 \
+  --env AGENT_PORT=8001 \
+  stardetect-agent:corex-4.4.0-sampling
+
+docker ps --filter name=stardetect-agent
+docker logs --tail=100 stardetect-agent
+```
+
+This path uses plain Docker because the target server does not have the Docker
+Compose plugin. If an older `stardetect-agent` container exists, remove that
+exact container before running the new one:
+
+```bash
+docker rm -f stardetect-agent
+```
+
+For this deployment path, ignore the private-registry and Buildx sections. They
+remain documented as an alternative for future CI-based image distribution.
+
+---
+
+## Alternative: build locally and deploy through a registry
+
+In this alternative workflow, the source repository is required only on the
+local build machine. The openEuler server pulls the finished image and does not
+build the project.
+
+There are three distinct steps:
+
+1. Once, publish the server-only CoreX base image to an authorized private registry.
+2. On the local development machine, cross-build and push the Agent image.
+3. On the openEuler server, enable vLLM tools, pull the Agent image, and run it.
+
+Replace these examples with the actual private registry and namespace:
 
 ```text
-HTTP API -> FastAPI -> LangChain agent -> Ollama qwen3.5:4b -> Jetson tools
+<registry>/<namespace>/corex-installer:4.4.0-py3.10-aarch64
+<registry>/<namespace>/stardetect-agent:corex-4.4.0
 ```
 
-Main endpoints:
+Do not publish the CoreX image to a public registry. Confirm that redistribution
+to the selected private registry is permitted by its license.
 
-- `GET /health`
-- `GET /api/tools`
-- `GET /api/telemetry/snapshot`
-- `POST /api/chat`
+## 1. Publish the CoreX base image once
 
-## 2. Package on Your Development Machine
-
-From the project root:
+Run this section on the openEuler server, where the base image already exists:
 
 ```bash
-cd /Users/baibing/development/code/ai/stardetect-agent
+docker image inspect \
+  installer:4.4.0-ubuntu-20.04-py3.10-llm-aarch64-10.2-full
+
+docker login <registry>
+
+docker tag \
+  installer:4.4.0-ubuntu-20.04-py3.10-llm-aarch64-10.2-full \
+  <registry>/<namespace>/corex-installer:4.4.0-py3.10-aarch64
+
+docker push \
+  <registry>/<namespace>/corex-installer:4.4.0-py3.10-aarch64
 ```
 
-Create a source package for transfer:
+This is a one-time prerequisite. It is not repeated for each Agent release.
+
+## 2. Cross-build and push the Agent locally
+
+Run this section from the repository root on the local development machine.
+Docker Buildx must be available, and the builder must be able to pull the private
+CoreX base image and Python packages.
 
 ```bash
-mkdir -p dist
-tar \
-  --exclude='.git' \
-  --exclude='.venv' \
-  --exclude='__pycache__' \
-  --exclude='.pytest_cache' \
-  --exclude='.ruff_cache' \
-  --exclude='dist' \
-  -czf dist/stardetect-agent-src.tar.gz .
+docker login <registry>
+
+docker buildx create \
+  --name stardetect-arm64-builder \
+  --driver docker-container \
+  --use
+
+docker buildx inspect --bootstrap
 ```
 
-Check the package:
+If the builder already exists:
 
 ```bash
-ls -lh dist/stardetect-agent-src.tar.gz
-tar -tzf dist/stardetect-agent-src.tar.gz | head
+docker buildx use stardetect-arm64-builder
 ```
 
-Alternative if the Orin is reachable over SSH and you prefer direct sync:
+Build a Linux AArch64 image and push it directly to the registry:
 
 ```bash
-rsync -av \
-  --exclude='.git' \
-  --exclude='.venv' \
-  --exclude='__pycache__' \
-  --exclude='.pytest_cache' \
-  --exclude='.ruff_cache' \
-  ./ orin-user@ORIN_IP:/home/orin-user/stardetect-agent/
+docker buildx build \
+  --platform linux/arm64 \
+  --build-arg COREX_BASE_IMAGE=<registry>/<namespace>/corex-installer:4.4.0-py3.10-aarch64 \
+  --tag <registry>/<namespace>/stardetect-agent:corex-4.4.0 \
+  --push \
+  .
 ```
 
-Replace `orin-user` and `ORIN_IP` with your real SSH user and Jetson IP.
+`--push` is required: a `docker-container` Buildx builder does not automatically
+place the result in the local Docker image store. On an Intel development
+machine the build uses QEMU and is slower; on Apple Silicon, `linux/arm64`
+matches the CPU architecture but still targets Linux rather than macOS.
 
-## 3. Send the Package to Jetson Orin
-
-Copy the tarball:
+Inspect the published architecture:
 
 ```bash
-scp dist/stardetect-agent-src.tar.gz orin-user@ORIN_IP:/home/orin-user/
+docker buildx imagetools inspect \
+  <registry>/<namespace>/stardetect-agent:corex-4.4.0
 ```
 
-On the Orin:
+The manifest must contain `linux/arm64`.
+
+## 3. Enable Qwen tool calling on the server
+
+No project files are needed for this step. The existing LLM container is
+`0754f3408644`.
+
+Stop only the old vLLM process:
 
 ```bash
-ssh orin-user@ORIN_IP
-mkdir -p ~/stardetect-agent
-tar -xzf ~/stardetect-agent-src.tar.gz -C ~/stardetect-agent
-cd ~/stardetect-agent
+docker exec 0754f3408644 \
+  pkill -f '/usr/local/corex-4.4.0/lib64/python3/dist-packages/bin/vllm serve'
 ```
 
-## 4. Prepare Orin Runtime
-
-Confirm Python:
+Start vLLM with Qwen3 Hermes tool parsing and the stable served model name
+`qwen3`:
 
 ```bash
-python3.11 --version
+docker exec -d 0754f3408644 bash -lc \
+  'vllm serve /models/Qwen3-4B \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --served-model-name qwen3 \
+    --max-model-len 2048 \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.5 \
+    --enable-auto-tool-choice \
+    --tool-call-parser hermes \
+    --reasoning-parser qwen3 \
+    >/nvme/vllm-tool-calls.log 2>&1'
 ```
 
-Expected:
+Check readiness:
+
+```bash
+docker exec 0754f3408644 tail -f /nvme/vllm-tool-calls.log
+```
+
+Press `Ctrl+C` after startup completes; this stops only `tail`.
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+```
+
+## 4. Create the shared network on the server
+
+No project files are needed:
+
+```bash
+docker network inspect stardetect-net >/dev/null 2>&1 ||
+  docker network create stardetect-net
+```
+
+Connect the running LLM container with the DNS alias `llm`:
+
+```bash
+docker network connect --alias llm stardetect-net 0754f3408644
+```
+
+If Docker reports that the endpoint already exists, inspect the network and
+confirm both the container and alias:
+
+```bash
+docker network inspect stardetect-net
+```
+
+## 5. Pull and run the Agent on the server
+
+The repository is not required. Log in and pull the cross-built image:
+
+```bash
+docker login <registry>
+docker pull <registry>/<namespace>/stardetect-agent:corex-4.4.0
+```
+
+First deployment:
+
+```bash
+docker run -d \
+  --name stardetect-agent \
+  --restart unless-stopped \
+  --network stardetect-net \
+  --device /dev/iluvatar0:/dev/iluvatar0 \
+  --publish 8001:8001 \
+  --env LLM_BASE_URL=http://llm:8000/v1 \
+  --env LLM_MODEL=qwen3 \
+  --env LLM_API_KEY=dummy \
+  --env IXSMI_PATH=/usr/local/corex-4.4.0/bin/ixsmi \
+  --env IXSMI_TIMEOUT_SECONDS=5 \
+  --env GPU_SAMPLING_INTERVAL_SECONDS=0.2 \
+  --env GPU_SAMPLING_WINDOW_SECONDS=5 \
+  --env AGENT_PORT=8001 \
+  <registry>/<namespace>/stardetect-agent:corex-4.4.0
+```
+
+For an upgrade, pull the new tag, replace only the Agent container, and rerun
+the command above:
+
+```bash
+docker rm -f stardetect-agent
+```
+
+Alternatively, copy only `compose.deploy.yaml` to the server, set
+`AGENT_IMAGE`, and deploy:
+
+```bash
+export AGENT_IMAGE=<registry>/<namespace>/stardetect-agent:corex-4.4.0
+docker compose -f compose.deploy.yaml up -d
+```
+
+## 6. Validate
+
+Check the container and its connection to vLLM:
+
+```bash
+docker ps --filter name=stardetect-agent
+docker logs --tail=100 stardetect-agent
+
+docker exec stardetect-agent \
+  curl -s http://llm:8000/v1/models
+```
+
+Check MR-V100 access:
+
+```bash
+docker exec stardetect-agent \
+  /usr/local/corex-4.4.0/bin/ixsmi \
+  --query-gpu=uuid,name,memory.total,memory.used,memory.free,temperature.gpu,utilization.gpu,utilization.memory \
+  --format=csv,nounits,noheader
+```
+
+Check the Agent APIs:
+
+```bash
+curl http://127.0.0.1:8001/health
+curl http://127.0.0.1:8001/api/tools
+curl http://127.0.0.1:8001/api/telemetry/snapshot
+```
+
+Test the Agent tool call:
+
+```bash
+curl http://127.0.0.1:8001/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"当前 GPU 温度、利用率和显存是多少？"}'
+```
+
+The response must contain `get_gpu_status` in `tool_calls`. A plain-text answer
+without a tool call does not pass deployment validation.
+
+The GPU response must also show `sampling.active: true` and a
+`utilization_window` for each device. After about five seconds of uptime,
+`sample_count` should be close to 25 with the default 0.2-second interval.
+
+## Troubleshooting
+
+### The local build cannot pull the CoreX base image
+
+Confirm the base image was pushed to the private registry, the local machine is
+logged in, and the registry repository name matches `COREX_BASE_IMAGE`.
+
+### `exec format error`
+
+The Agent was built for the wrong architecture. Rebuild with:
 
 ```text
-Python 3.11.15
+--platform linux/arm64
 ```
 
-Create and activate the virtual environment:
+Then confirm the registry manifest with `docker buildx imagetools inspect`.
+
+### Agent cannot resolve `llm`
 
 ```bash
-python3.11 -m venv .venv
-. .venv/bin/activate
-pip install --upgrade pip
+docker network inspect stardetect-net
 ```
 
-Install the agent:
+Both containers must be present, and the LLM container must have alias `llm`.
+If the LLM container is already attached without that alias, reconnect only
+this additional network:
 
 ```bash
-pip install -e .
+docker network disconnect stardetect-net llm-qwen-test
+docker network connect --alias llm stardetect-net llm-qwen-test
 ```
 
-For development checks on Orin, install dev dependencies too:
+The host port 8000 and the default bridge remain available while this additional
+network attachment is replaced.
+
+### `ixsmi_not_found` or no GPU
+
+Confirm that the Agent uses the CoreX base image and maps the device:
 
 ```bash
-pip install -e ".[dev]"
+docker inspect stardetect-agent --format '{{json .HostConfig.Devices}}'
+docker exec stardetect-agent /usr/local/corex-4.4.0/bin/ixsmi -L
 ```
 
-Create local configuration:
+### Model answers without tool calls
 
 ```bash
-cp .env.example .env
+docker exec 0754f3408644 ps -ef
 ```
 
-Default `.env` values:
-
-```bash
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=qwen3.5:4b
-```
-
-## 5. Verify Jetson and Ollama Prerequisites
-
-Check Ollama:
-
-```bash
-ollama list | grep qwen3.5:4b
-curl http://127.0.0.1:11434/api/tags
-```
-
-If the model is missing:
-
-```bash
-ollama pull qwen3.5:4b
-```
-
-Check Jetson telemetry command:
-
-```bash
-which tegrastats
-tegrastats --interval 1000
-```
-
-Stop `tegrastats` with `Ctrl+C` after one or two lines.
-
-The API can still start if `tegrastats` is unavailable, but telemetry fields will
-report unavailable or partial data.
-
-## 6. Run the API
-
-Start the service:
-
-```bash
-. .venv/bin/activate
-uvicorn stardetect_agent.api.main:app --host 0.0.0.0 --port 8000
-```
-
-Equivalent command:
-
-```bash
-stardetect-agent
-```
-
-Keep this terminal open while testing.
-
-## 7. Verify Locally on Orin
-
-Health check:
-
-```bash
-curl http://127.0.0.1:8000/health
-```
-
-Expected shape:
-
-```json
-{
-  "status": "ok",
-  "ollama_model": "qwen3.5:4b",
-  "ollama_base_url": "http://127.0.0.1:11434"
-}
-```
-
-List registered tools:
-
-```bash
-curl http://127.0.0.1:8000/api/tools
-```
-
-Expected tool names:
-
-- `get_system_snapshot`
-- `get_memory_status`
-- `get_storage_status`
-- `get_temperature_status`
-- `get_power_status`
-
-Read telemetry directly, without the LLM:
-
-```bash
-curl http://127.0.0.1:8000/api/telemetry/snapshot
-```
-
-Ask the agent to use Jetson tools:
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message":"当前 GPU 温度、内存、存储和功耗是多少？"}'
-```
-
-Successful response shape:
-
-```json
-{
-  "answer": "...",
-  "tool_calls": [
-    {
-      "name": "get_system_snapshot",
-      "args": {},
-      "id": "..."
-    }
-  ]
-}
-```
-
-## 8. Telemetry Sources and Calculations
-
-The agent exposes telemetry through LangChain tools, but the values are read from
-local Jetson/Linux sources. The main aggregation endpoint is:
-
-```bash
-curl http://127.0.0.1:8000/api/telemetry/snapshot
-```
-
-### Temperature
-
-Primary source:
-
-```bash
-tegrastats --interval 1000
-```
-
-The parser reads fields like:
-
-```text
-GPU@45.531C CPU@51.25C Tboard@40C
-```
-
-It extracts `name@valueC` and returns the value in Celsius.
-
-Fallback/additional source:
-
-```text
-/sys/class/thermal/thermal_zone*/type
-/sys/class/thermal/thermal_zone*/temp
-```
-
-The sysfs temperature value is usually in millicelsius:
-
-```text
-celsius = temp / 1000
-```
-
-### Memory
-
-System RAM and swap source:
-
-```python
-psutil.virtual_memory()
-psutil.swap_memory()
-```
-
-This is Linux system memory information exposed through `psutil`.
-
-The provider also parses `tegrastats` memory fields:
-
-```text
-RAM 18968/62795MB
-SWAP 0/31398MB (cached 0MB)
-```
-
-Calculations:
-
-```text
-available_mb = total_mb - used_mb
-used_percent = used_mb / total_mb * 100
-```
-
-GPU/GR3D status is parsed from `tegrastats` when present:
-
-```text
-GR3D_FREQ 0%@611
-```
-
-### Storage
-
-Storage source:
-
-```python
-shutil.disk_usage("/")
-```
-
-This reads the root filesystem usage. The provider returns:
-
-```text
-total_gb
-used_gb
-free_gb
-used_percent
-```
-
-Calculations:
-
-```text
-gb = bytes / 1024 / 1024 / 1024
-used_percent = used / total * 100
-```
-
-### Power
-
-First, the provider tries to parse power rails from `tegrastats` if they exist:
-
-```text
-VDD_GPU_SOC 716mW/716mW
-VIN_SYS_5V0 2772mW/2772mW
-```
-
-On the tested Jetson Orin, `tegrastats` did not expose power rails, so the
-provider reads INA3221 sysfs nodes instead. It scans:
-
-```text
-/sys/class/hwmon/hwmon*
-/sys/bus/i2c/drivers/ina3221/**/hwmon*
-/sys/bus/i2c/drivers/ina3221x/**/iio:device*
-/sys/bus/i2c/devices/**/hwmon*
-/sys/devices/platform/**/hwmon*
-```
-
-The confirmed Orin paths were:
-
-```text
-/sys/devices/platform/c240000.i2c/i2c-1/1-0040/hwmon/hwmon3
-/sys/devices/platform/c240000.i2c/i2c-1/1-0041/hwmon/hwmon4
-```
-
-For each power rail, the provider reads:
-
-```text
-inN_label   -> rail name, for example VDD_GPU_SOC
-inN_input   -> voltage in mV
-currN_input -> current in mA
-```
-
-Power calculation:
-
-```text
-instant_mw = voltage_mv * current_ma / 1000
-instant_w = instant_mw / 1000
-total_instant_w = sum(valid rail instant_w)
-```
-
-The tested Orin exposes one special channel mapping:
-
-```text
-in7_label / in7_input -> curr4_input
-```
-
-The provider skips non-rail labels:
-
-```text
-NC
-sum of shunt voltages
-```
-
-If ordinary users cannot read the INA3221 files, run the service with sufficient
-permissions during validation:
-
-```bash
-sudo -E .venv/bin/uvicorn stardetect_agent.api.main:app --host 0.0.0.0 --port 8000
-```
-
-## 9. Verify from Another Machine
-
-From your laptop or another machine on the same network:
-
-```bash
-curl http://ORIN_IP:8000/health
-```
-
-If this fails but local Orin checks pass, inspect network/firewall settings and
-confirm the API was started with `--host 0.0.0.0`.
-
-## 10. Run Tests on Orin
-
-Install dev dependencies first:
-
-```bash
-pip install -e ".[dev]"
-```
-
-Run checks:
-
-```bash
-pytest
-ruff check .
-```
-
-Expected:
-
-```text
-13 passed
-All checks passed!
-```
-
-## 11. Optional Background Run
-
-For a simple background run during development:
-
-```bash
-nohup .venv/bin/uvicorn stardetect_agent.api.main:app \
-  --host 0.0.0.0 \
-  --port 8000 \
-  > stardetect-agent.log 2>&1 &
-```
-
-Check logs:
-
-```bash
-tail -f stardetect-agent.log
-```
-
-Stop it:
-
-```bash
-pkill -f 'uvicorn stardetect_agent.api.main:app'
-```
-
-For production, prefer a `systemd` service that runs the venv executable from
-the project directory.
-
-## 12. Troubleshooting
-
-If `/api/chat` fails:
-
-- Confirm Ollama is running: `curl http://127.0.0.1:11434/api/tags`
-- Confirm the model exists: `ollama list | grep qwen3.5:4b`
-- Confirm `.env` has the right `OLLAMA_BASE_URL` and `OLLAMA_MODEL`
-
-If telemetry is empty or partial:
-
-- Run `tegrastats --interval 1000` manually
-- Confirm the process user can read `/sys/class/thermal`
-- For Orin power rails, check INA3221 sysfs nodes:
-
-```bash
-find /sys/bus/i2c/drivers/ina3221 -maxdepth 4 -type f \
-  \( -name 'in*_label' -o -name 'in*_input' -o -name 'curr*_input' \) \
-  -print 2>/dev/null
-```
-
-- Typical Orin rails include `VDD_GPU_SOC`, `VDD_CPU_CV`, and `VIN_SYS_5V0`
-- Use `/api/telemetry/snapshot` to separate Jetson tool issues from LLM issues
-
-If remote access fails:
-
-- Confirm `uvicorn` was started with `--host 0.0.0.0`
-- Test locally first: `curl http://127.0.0.1:8000/health`
-- Check the Jetson IP address and firewall rules
+The vLLM command must contain both `--enable-auto-tool-choice` and
+`--tool-call-parser hermes`.

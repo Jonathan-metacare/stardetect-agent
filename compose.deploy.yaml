@@ -1,0 +1,26 @@
+services:
+  stardetect-agent:
+    image: ${AGENT_IMAGE:?Set AGENT_IMAGE to the pushed linux/arm64 agent image}
+    pull_policy: always
+    container_name: stardetect-agent
+    restart: unless-stopped
+    environment:
+      LLM_BASE_URL: http://llm:8000/v1
+      LLM_MODEL: qwen3
+      LLM_API_KEY: dummy
+      IXSMI_PATH: /usr/local/corex-4.4.0/bin/ixsmi
+      IXSMI_TIMEOUT_SECONDS: "5"
+      GPU_SAMPLING_INTERVAL_SECONDS: "0.2"
+      GPU_SAMPLING_WINDOW_SECONDS: "5"
+      AGENT_PORT: "8001"
+    devices:
+      - /dev/iluvatar0:/dev/iluvatar0
+    ports:
+      - "8001:8001"
+    networks:
+      - stardetect-net
+
+networks:
+  stardetect-net:
+    external: true
+    name: stardetect-net

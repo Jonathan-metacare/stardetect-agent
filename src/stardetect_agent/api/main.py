@@ -1,17 +1,30 @@
+from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 
-from stardetect_agent.agent.service import AgentService, get_agent_service
+from stardetect_agent.agent.service import AgentService, AgentUpstreamError, get_agent_service
 from stardetect_agent.api.schemas import ChatRequest, ChatResponse, HealthResponse
 from stardetect_agent.config import Settings, get_settings
-from stardetect_agent.jetson.provider import JetsonMetricsProvider, get_metrics_provider
-from stardetect_agent.jetson.tools import list_tool_metadata
+from stardetect_agent.system.provider import SystemMetricsProvider, get_metrics_provider
+from stardetect_agent.system.tools import list_tool_metadata
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    provider = get_metrics_provider()
+    provider.start_sampling()
+    try:
+        yield
+    finally:
+        provider.stop_sampling()
+
 
 app = FastAPI(
-    title="Stardetect Jetson Agent",
+    title="Stardetect Iluvatar Agent",
     version="0.1.0",
-    description="FastAPI service exposing a LangChain agent with Jetson Orin telemetry tools.",
+    description="FastAPI service exposing a LangChain agent with Iluvatar GPU telemetry tools.",
+    lifespan=lifespan,
 )
 
 
@@ -19,8 +32,9 @@ app = FastAPI(
 def health(settings: Annotated[Settings, Depends(get_settings)]) -> HealthResponse:
     return HealthResponse(
         status="ok",
-        ollama_model=settings.ollama_model,
-        ollama_base_url=settings.ollama_base_url,
+        model_backend="openai_compatible",
+        model=settings.llm_model,
+        base_url=settings.llm_base_url,
     )
 
 
@@ -31,7 +45,7 @@ def tools() -> dict[str, object]:
 
 @app.get("/api/telemetry/snapshot")
 def telemetry_snapshot(
-    provider: Annotated[JetsonMetricsProvider, Depends(get_metrics_provider)],
+    provider: Annotated[SystemMetricsProvider, Depends(get_metrics_provider)],
 ) -> dict[str, object]:
     return provider.get_system_snapshot()
 
@@ -41,5 +55,14 @@ def chat(
     request: ChatRequest,
     service: Annotated[AgentService, Depends(get_agent_service)],
 ) -> ChatResponse:
-    result = service.invoke(request.message)
+    try:
+        result = service.invoke(request.message)
+    except AgentUpstreamError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": exc.code,
+                "message": exc.message,
+            },
+        ) from exc
     return ChatResponse(**result)
