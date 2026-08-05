@@ -1,0 +1,3 @@
+请将下面这句话翻译成中文，只输出译文：
+
+The satellite payload is operating normally.
