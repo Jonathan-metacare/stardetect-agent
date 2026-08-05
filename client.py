@@ -11,9 +11,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Ask the Stardetect FastAPI agent a question.")
     parser.add_argument("question", help="User question to send to the agent.")
     parser.add_argument(
+        "--image-url",
+        help="Optional http(s) image URL or base64 data:image URL to analyze.",
+    )
+    parser.add_argument(
         "--base-url",
-        default="http://127.0.0.1:8000",
-        help="FastAPI base URL. Default: http://127.0.0.1:8000",
+        default="http://127.0.0.1:8001",
+        help="FastAPI base URL. Default: http://127.0.0.1:8001",
     )
     parser.add_argument(
         "--timeout",
@@ -24,7 +28,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        response = ask_agent(args.base_url, args.question, args.timeout)
+        response = ask_agent(args.base_url, args.question, args.timeout, args.image_url)
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
         print(f"request failed: {exc}", file=sys.stderr)
         return 1
@@ -41,9 +45,17 @@ def main() -> int:
     return 0
 
 
-def ask_agent(base_url: str, question: str, timeout: float) -> dict[str, Any]:
+def ask_agent(
+    base_url: str,
+    question: str,
+    timeout: float,
+    image_url: str | None = None,
+) -> dict[str, Any]:
     url = f"{base_url.rstrip('/')}/api/chat"
-    payload = json.dumps({"message": question}, ensure_ascii=False).encode("utf-8")
+    payload_data: dict[str, str] = {"message": question}
+    if image_url is not None:
+        payload_data["image_url"] = image_url
+    payload = json.dumps(payload_data, ensure_ascii=False).encode("utf-8")
     request = Request(
         url,
         data=payload,
@@ -57,4 +69,3 @@ def ask_agent(base_url: str, question: str, timeout: float) -> dict[str, Any]:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

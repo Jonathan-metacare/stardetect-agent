@@ -56,7 +56,7 @@ def chat(
     service: Annotated[AgentService, Depends(get_agent_service)],
 ) -> ChatResponse:
     try:
-        result = service.invoke(request.message)
+        result = service.invoke(request.message, image_url=request.image_url)
     except AgentUpstreamError as exc:
         raise HTTPException(
             status_code=502,

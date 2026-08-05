@@ -8,8 +8,8 @@ COPY src ./src
 
 RUN python3 -m pip install --no-cache-dir .
 
-ENV LLM_BASE_URL=http://llm:8000/v1 \
-    LLM_MODEL=qwen3 \
+ENV LLM_BASE_URL=http://llm-vl:8000/v1 \
+    LLM_MODEL=qwen3-vl \
     LLM_API_KEY=dummy \
     IXSMI_PATH=/usr/local/corex-4.4.0/bin/ixsmi \
     IXSMI_TIMEOUT_SECONDS=5 \

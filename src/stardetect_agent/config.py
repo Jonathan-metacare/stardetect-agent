@@ -7,8 +7,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Runtime settings loaded from environment variables or .env."""
 
-    llm_base_url: str = Field(default="http://llm:8000/v1")
-    llm_model: str = Field(default="qwen3")
+    llm_base_url: str = Field(default="http://llm-vl:8000/v1")
+    llm_model: str = Field(default="qwen3-vl")
     llm_api_key: str = Field(default="dummy")
     ixsmi_path: str = Field(default="/usr/local/corex-4.4.0/bin/ixsmi")
     ixsmi_timeout_seconds: float = Field(default=5.0, gt=0)

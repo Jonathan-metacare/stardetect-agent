@@ -18,18 +18,18 @@ class FakeProvider:
 
 
 class FakeAgentService:
-    def invoke(self, message: str) -> dict[str, object]:
+    def invoke(self, message: str, image_url: str | None = None) -> dict[str, object]:
         return {
-            "answer": f"mock answer: {message}",
+            "answer": f"mock answer: {message}; image={image_url}",
             "tool_calls": [{"name": "get_system_snapshot", "args": {}, "id": "mock"}],
         }
 
 
 class FailingAgentService:
-    def invoke(self, message: str) -> dict[str, object]:
+    def invoke(self, message: str, image_url: str | None = None) -> dict[str, object]:
         raise AgentUpstreamError(
             "llm_connection_failed",
-            "Cannot connect to LLM endpoint http://llm:8000/v1",
+            "Cannot connect to LLM endpoint http://llm-vl:8000/v1",
         )
 
 
@@ -41,8 +41,8 @@ def test_health_endpoint() -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["model_backend"] == "openai_compatible"
-    assert response.json()["model"] == "qwen3"
-    assert response.json()["base_url"] == "http://llm:8000/v1"
+    assert response.json()["model"] == "qwen3-vl"
+    assert response.json()["base_url"] == "http://llm-vl:8000/v1"
 
 
 def test_tools_endpoint() -> None:
@@ -76,8 +76,38 @@ def test_chat_endpoint_with_mock_agent() -> None:
 
     app.dependency_overrides.clear()
     assert response.status_code == 200
-    assert response.json()["answer"] == "mock answer: GPU 温度是多少？"
+    assert response.json()["answer"] == "mock answer: GPU 温度是多少？; image=None"
     assert response.json()["tool_calls"][0]["name"] == "get_system_snapshot"
+
+
+def test_chat_endpoint_accepts_image_url() -> None:
+    app.dependency_overrides[get_agent_service] = lambda: FakeAgentService()
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/chat",
+        json={
+            "message": "请描述这张图片",
+            "image_url": "https://example.com/status.png",
+        },
+    )
+
+    app.dependency_overrides.clear()
+    assert response.status_code == 200
+    assert response.json()["answer"] == (
+        "mock answer: 请描述这张图片; image=https://example.com/status.png"
+    )
+
+
+def test_chat_endpoint_rejects_unsupported_image_url() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/chat",
+        json={"message": "请描述这张图片", "image_url": "file:///etc/passwd"},
+    )
+
+    assert response.status_code == 422
 
 
 def test_chat_endpoint_returns_diagnostic_502_for_upstream_failure() -> None:
@@ -91,6 +121,6 @@ def test_chat_endpoint_returns_diagnostic_502_for_upstream_failure() -> None:
     assert response.json() == {
         "detail": {
             "code": "llm_connection_failed",
-            "message": "Cannot connect to LLM endpoint http://llm:8000/v1",
+            "message": "Cannot connect to LLM endpoint http://llm-vl:8000/v1",
         }
     }

@@ -55,9 +55,15 @@ class AgentService:
             system_prompt=SYSTEM_PROMPT,
         )
 
-    def invoke(self, message: str) -> dict[str, Any]:
+    def invoke(self, message: str, image_url: str | None = None) -> dict[str, Any]:
+        content: str | list[dict[str, object]] = message
+        if image_url is not None:
+            content = [
+                {"type": "text", "text": message},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]
         try:
-            result = self._agent.invoke({"messages": [{"role": "user", "content": message}]})
+            result = self._agent.invoke({"messages": [{"role": "user", "content": content}]})
         except APIConnectionError as exc:
             raise AgentUpstreamError(
                 "llm_connection_failed",

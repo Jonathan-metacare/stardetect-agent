@@ -17,13 +17,12 @@ docker image inspect \
 Extract an uploaded archive into a versioned directory:
 
 ```bash
-mkdir -p /opt/stardetect-agent-qwen3-20260728
+mkdir -p /opt/stardetect-agent-qwen3vl-multimodal-20260804
 
-tar -xzf /tmp/stardetect-agent-corex-4.4.0-qwen3-sampling-20260728.tar.gz \
-  -C /opt/stardetect-agent-qwen3-20260728 \
-  --strip-components=1
+tar -xzf /tmp/stardetect-agent-corex-4.4.0-qwen3vl-multimodal-20260804.tar.gz \
+  -C /opt/stardetect-agent-qwen3vl-multimodal-20260804
 
-cd /opt/stardetect-agent-qwen3-20260728
+cd /opt/stardetect-agent-qwen3vl-multimodal-20260804
 ```
 
 After enabling vLLM tool calling and creating `stardetect-net` as documented
@@ -38,8 +37,8 @@ docker run -d \
   --network stardetect-net \
   --device /dev/iluvatar0:/dev/iluvatar0 \
   --publish 8001:8001 \
-  --env LLM_BASE_URL=http://llm:8000/v1 \
-  --env LLM_MODEL=qwen3 \
+  --env LLM_BASE_URL=http://llm-vl:8000/v1 \
+  --env LLM_MODEL=qwen3-vl \
   --env LLM_API_KEY=dummy \
   --env IXSMI_PATH=/usr/local/corex-4.4.0/bin/ixsmi \
   --env IXSMI_TIMEOUT_SECONDS=5 \
@@ -155,46 +154,53 @@ docker buildx imagetools inspect \
 
 The manifest must contain `linux/arm64`.
 
-## 3. Enable Qwen tool calling on the server
+## 3. Run Qwen3-VL with native tool calling on the server
 
-No project files are needed for this step. The existing LLM container is
-`0754f3408644`.
-
-Stop only the old vLLM process:
-
-```bash
-docker exec 0754f3408644 \
-  pkill -f '/usr/local/corex-4.4.0/lib64/python3/dist-packages/bin/vllm serve'
-```
-
-Start vLLM with Qwen3 Hermes tool parsing and the stable served model name
-`qwen3`:
+The current deployment uses Qwen3-VL as the only model. It exposes host port
+`8003`, while containers on `stardetect-net` use the stable DNS name
+`llm-vl:8000`.
 
 ```bash
-docker exec -d 0754f3408644 bash -lc \
-  'vllm serve /models/Qwen3-4B \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --served-model-name qwen3 \
-    --max-model-len 2048 \
-    --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.5 \
-    --enable-auto-tool-choice \
-    --tool-call-parser hermes \
-    --reasoning-parser qwen3 \
-    >/nvme/vllm-tool-calls.log 2>&1'
+docker run -d \
+  --name llm-qwen3-vl \
+  --restart unless-stopped \
+  --privileged \
+  --security-opt label=disable \
+  --device=/dev/iluvatar0:/dev/iluvatar0 \
+  --shm-size=16g \
+  --ulimit nofile=65535:65535 \
+  --network stardetect-net \
+  --network-alias llm-vl \
+  --publish 8003:8000 \
+  --volume /nvme/models:/models \
+  qwen-llm-openai:4.4.0-aarch64 \
+  bash -lc '
+    source /usr/local/corex/enable
+    exec vllm serve /models/Qwen3-VL-4B-Instruct \
+      --host 0.0.0.0 \
+      --port 8000 \
+      --tensor-parallel-size 1 \
+      --gpu-memory-utilization 0.7 \
+      --max-model-len 4096 \
+      --max-num-seqs 4 \
+      --served-model-name qwen3-vl \
+      --limit-mm-per-prompt "{\"image\":1,\"video\":0}" \
+      --mm-processor-kwargs "{\"min_pixels\":262144,\"max_pixels\":1310720}" \
+      --compilation-config "{\"custom_ops\":[\"all\",\"-rotary_embedding\"]}" \
+      --enable-auto-tool-choice \
+      --tool-call-parser hermes
+  '
 ```
+
+The CoreX 4.4.0 image lacks the header needed by Triton's Qwen3-VL MRoPE path.
+`-rotary_embedding` selects vLLM's native fallback. The configured pixel budget
+keeps one image within the 4096-token context limit.
 
 Check readiness:
 
 ```bash
-docker exec 0754f3408644 tail -f /nvme/vllm-tool-calls.log
-```
-
-Press `Ctrl+C` after startup completes; this stops only `tail`.
-
-```bash
-curl http://127.0.0.1:8000/v1/models
+docker logs -f llm-qwen3-vl
+curl http://127.0.0.1:8003/v1/models
 ```
 
 ## 4. Create the shared network on the server
@@ -206,10 +212,11 @@ docker network inspect stardetect-net >/dev/null 2>&1 ||
   docker network create stardetect-net
 ```
 
-Connect the running LLM container with the DNS alias `llm`:
+The Qwen3-VL launch command above already joins this network with the `llm-vl`
+alias. If the existing container was started without the network, connect it:
 
 ```bash
-docker network connect --alias llm stardetect-net 0754f3408644
+docker network connect --alias llm-vl stardetect-net llm-qwen3-vl
 ```
 
 If Docker reports that the endpoint already exists, inspect the network and
@@ -237,8 +244,8 @@ docker run -d \
   --network stardetect-net \
   --device /dev/iluvatar0:/dev/iluvatar0 \
   --publish 8001:8001 \
-  --env LLM_BASE_URL=http://llm:8000/v1 \
-  --env LLM_MODEL=qwen3 \
+  --env LLM_BASE_URL=http://llm-vl:8000/v1 \
+  --env LLM_MODEL=qwen3-vl \
   --env LLM_API_KEY=dummy \
   --env IXSMI_PATH=/usr/local/corex-4.4.0/bin/ixsmi \
   --env IXSMI_TIMEOUT_SECONDS=5 \
@@ -272,7 +279,7 @@ docker ps --filter name=stardetect-agent
 docker logs --tail=100 stardetect-agent
 
 docker exec stardetect-agent \
-  curl -s http://llm:8000/v1/models
+  curl -s http://llm-vl:8000/v1/models
 ```
 
 Check MR-V100 access:
@@ -298,6 +305,10 @@ Test the Agent tool call:
 curl http://127.0.0.1:8001/api/chat \
   -H 'Content-Type: application/json' \
   -d '{"message":"当前 GPU 温度、利用率和显存是多少？"}'
+
+curl http://127.0.0.1:8001/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"请描述图片中的主要内容", "image_url":"https://example.com/image.jpg"}'
 ```
 
 The response must contain `get_gpu_status` in `tool_calls`. A plain-text answer
