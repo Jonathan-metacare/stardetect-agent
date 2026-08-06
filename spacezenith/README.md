@@ -1,7 +1,7 @@
 # SpaceZenith 星载 APP_1
 
 `app_1` 是供 AI 单机平台启动的 C++17 历史任务 APP。它只调用本机已经运行的
-Stardetect Agent，不访问 GPU 设备，也不实现遥测或 domain socket 通信。
+Stardetect Agent，不访问 GPU 设备；它通过平台提供的 Unix domain socket 上报任务遥测。
 
 ## 指令模式
 
@@ -13,8 +13,29 @@ Stardetect Agent，不访问 GPU 设备，也不实现遥测或 domain socket �
 | `2` | 文字 prompt 回复 | `1` 对应 `raw/prompt1.txt`；`2` 对应 `raw/prompt2.txt` | `argv[6]`：UTF-8 JSON |
 
 APP 只读取 `argv[3]` 对应 APP 工作目录的上级 `raw/` 目录，绝不读取平台传入的
-`argv[4]`、`argv[5]` 输入通道。`argv[7]` 和 `argv[8]` 在本版保留但不使用。收到
-`SIGTERM` 时程序会停止当前处理、尝试写入取消结果并退出；不会创建子进程。
+`argv[4]`、`argv[5]` 输入通道。`argv[7]` 在本版保留但不使用。`argv[8]` 是平台
+Unix domain socket server 的路径；`argv[9]` 必须是 `0` 到 `255` 的十进制设备码。收到
+`SIGTERM` 时程序会停止当前处理、尝试写入取消结果、发送取消遥测并退出；不会创建子进程。
+
+## 平台遥测
+
+平台软件必须先创建 `argv[8]` 指向的 Unix domain socket server，APP_1 作为 client
+连接。遥测链路异常不会中断图像识别或文字任务，APP 会将告警写到标准输出，并在下一个
+周期尝试重连。
+
+APP 发送 1 字节对齐、固定 1066 字节的 `InnerTeleFrame`：`source_device` 为 `argv[9]`，
+`cmd` 固定为 `0x00`，`length` 以小端序写入 `1`，`data[0]` 为状态码，其余 `data` 字节为
+零。运行中每 500ms 上报一次，并在退出前额外上报一次终态：
+
+| `data[0]` | 含义 |
+| --- | --- |
+| `0x00` | 运行中 |
+| `0x01` | 成功 |
+| `0x02` | 失败 |
+| `0x03` | 因 `SIGTERM` 取消 |
+
+每帧均完整发送固定结构体；有效数据长度为 1 字节，因此符合平台对遥测有效数据不超过
+60 字节的限制。
 
 ## 构建与安装
 
@@ -91,5 +112,6 @@ socket 对应用户组；否则结果 JSON 会返回 `backend_docker_failed`。
 python3 tests/test_app.py
 ```
 
-测试会临时编译 APP，并以本地 mock Agent 和 mock Docker 覆盖图像 JPEG/PNG、预置
-prompt、Docker 启停及既有容器保护、参数错误、HTTP 错误、超时和 SIGTERM 收尾行为。
+测试会临时编译 APP，并以本地 mock Agent、mock Docker 和 Unix socket server 覆盖图像
+JPEG/PNG、预置 prompt、Docker 启停及既有容器保护、遥测帧、参数错误、HTTP 错误、超时和
+SIGTERM 收尾行为。

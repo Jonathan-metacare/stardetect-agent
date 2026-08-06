@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
+import struct
 import subprocess
 import tempfile
 import threading
@@ -15,6 +17,64 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TELEMETRY_FRAME_SIZE = 1066
+
+
+class MockTelemetryServer:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.frames: list[bytes] = []
+        self._condition = threading.Condition()
+        self._stopping = threading.Event()
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(str(path))
+        self._server.listen()
+        self._server.settimeout(0.1)
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+
+    def _accept_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                connection, _ = self._server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._read_connection, args=(connection,), daemon=True).start()
+
+    def _read_connection(self, connection: socket.socket) -> None:
+        pending = b""
+        try:
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    return
+                pending += chunk
+                while len(pending) >= TELEMETRY_FRAME_SIZE:
+                    frame, pending = pending[:TELEMETRY_FRAME_SIZE], pending[TELEMETRY_FRAME_SIZE:]
+                    with self._condition:
+                        self.frames.append(frame)
+                        self._condition.notify_all()
+        finally:
+            connection.close()
+
+    def wait_for_status(self, status: int, count: int = 1, timeout: float = 3.0) -> list[bytes]:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while sum(frame[6] == status for frame in self.frames) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(f"did not receive telemetry status {status:#x}: {self.frames!r}")
+                self._condition.wait(remaining)
+            return list(self.frames)
+
+    def close(self) -> None:
+        self._stopping.set()
+        self._server.close()
+        self._thread.join(timeout=1)
+        if self.path.exists():
+            self.path.unlink()
 
 
 class MockAgentHandler(BaseHTTPRequestHandler):
@@ -77,6 +137,8 @@ class AppIntegrationTests(unittest.TestCase):
         self.docker_state_dir = Path(self.task_dir.name) / "docker-state"
         self.docker_state_dir.mkdir()
         self.docker_log = Path(self.task_dir.name) / "docker.log"
+        self.telemetry_path = Path(self.task_dir.name) / "telemetry.sock"
+        self.telemetry = MockTelemetryServer(self.telemetry_path)
         self.fake_docker = Path(self.task_dir.name) / "docker"
         for container in ("llm-qwen3-vl", "stardetect-agent"):
             (self.docker_state_dir / container).write_text("false\n", encoding="utf-8")
@@ -119,13 +181,21 @@ class AppIntegrationTests(unittest.TestCase):
         self.result = Path(self.task_dir.name) / "result.json"
 
     def tearDown(self) -> None:
+        self.telemetry.close()
         self.task_dir.cleanup()
 
-    def run_app(self, mode: str, preset_id: str = "1") -> subprocess.CompletedProcess[str]:
+    def run_app(
+        self,
+        mode: str,
+        preset_id: str = "1",
+        telemetry_path: Path | None = None,
+        device_code: str = "7",
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 str(self.executable), mode, preset_id, str(self.work_dir), "/unused/ch1",
-                "/unused/ch2", str(self.result), "/unused/result2", "/unused/socket", "7",
+                "/unused/ch2", str(self.result), "/unused/result2",
+                str(telemetry_path or self.telemetry_path), device_code,
             ],
             text=True,
             capture_output=True,
@@ -145,6 +215,19 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual(result["mode"], "image_recognition")
         self.assertEqual(result["input"]["preset_id"], 1)
         self.assertEqual(result["answer"], "识别到测试图像")
+
+    def test_telemetry_frame_and_periodic_running_status(self) -> None:
+        MockAgentHandler.response_delay_seconds = 0.7
+        completed = self.run_app("2")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        frames = self.telemetry.wait_for_status(0x01)
+        self.assertGreaterEqual(sum(frame[6] == 0x00 for frame in frames), 2)
+        for frame in frames:
+            self.assertEqual(len(frame), TELEMETRY_FRAME_SIZE)
+            self.assertEqual(frame[0], 7)
+            self.assertEqual(frame[1], 0)
+            self.assertEqual(struct.unpack_from("<I", frame, 2)[0], 1)
+            self.assertTrue(all(value == 0 for value in frame[7:]))
 
     def test_png_image_request(self) -> None:
         (self.raw_dir / "image2.png").write_bytes(b"\x89PNG\r\n\x1a\nminimal")
@@ -205,6 +288,19 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         result = json.loads(self.result.read_text(encoding="utf-8"))
         self.assertEqual(result["error"]["code"], "preset_not_found")
+        self.telemetry.wait_for_status(0x02)
+
+    def test_missing_telemetry_socket_does_not_fail_task(self) -> None:
+        completed = self.run_app("2", telemetry_path=Path(self.task_dir.name) / "missing.sock")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("cannot connect telemetry socket", completed.stderr)
+
+    def test_invalid_device_code_writes_error(self) -> None:
+        for device_code in ("256", "not-a-number"):
+            completed = self.run_app("2", device_code=device_code)
+            self.assertNotEqual(completed.returncode, 0)
+            result = json.loads(self.result.read_text(encoding="utf-8"))
+            self.assertEqual(result["error"]["code"], "invalid_device_code")
 
     def test_bad_mode_and_http_error_write_errors(self) -> None:
         completed = self.run_app("3")
@@ -229,7 +325,7 @@ class AppIntegrationTests(unittest.TestCase):
         process = subprocess.Popen(
             [
                 str(self.executable), "2", "1", str(self.work_dir), "/unused/ch1",
-                "/unused/ch2", str(self.result), "/unused/result2", "/unused/socket", "7",
+                "/unused/ch2", str(self.result), "/unused/result2", str(self.telemetry_path), "7",
             ],
             text=True,
             stdout=subprocess.PIPE,
@@ -242,6 +338,7 @@ class AppIntegrationTests(unittest.TestCase):
         process.communicate(timeout=5)
         self.assertEqual(process.returncode, 143)
         self.assertEqual(json.loads(self.result.read_text())["error"]["code"], "cancelled")
+        self.telemetry.wait_for_status(0x03)
 
 
 if __name__ == "__main__":

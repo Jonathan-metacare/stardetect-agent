@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -22,13 +23,17 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
+#include <condition_variable>
 
 namespace {
 
@@ -67,6 +72,219 @@ struct AppError : std::runtime_error {
 
   AppError(std::string error_code, const std::string& message)
       : std::runtime_error(message), code(std::move(error_code)) {}
+};
+
+constexpr std::size_t kTelemetryFrameSize = 1066U;
+constexpr int kTelemetryIntervalMs = 500;
+constexpr int kTelemetryIoTimeoutMs = 200;
+
+enum class TelemetryStatus : std::uint8_t {
+  kRunning = 0x00,
+  kSuccess = 0x01,
+  kFailure = 0x02,
+  kCancelled = 0x03,
+};
+
+#pragma pack(push, 1)
+struct InnerTeleFrame {
+  std::uint8_t source_device;
+  std::uint8_t cmd;
+  std::uint32_t length_le;
+  std::array<std::uint8_t, 1060> data;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(InnerTeleFrame) == kTelemetryFrameSize,
+              "InnerTeleFrame must match the platform's 1066-byte wire format");
+
+std::uint8_t parse_device_code(const std::string& value) {
+  if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isdigit(ch) != 0;
+      })) {
+    throw AppError("invalid_device_code", "argv[9] must be a decimal device code from 0 to 255");
+  }
+  std::size_t consumed = 0;
+  unsigned long parsed = 0;
+  try {
+    parsed = std::stoul(value, &consumed, 10);
+  } catch (const std::exception&) {
+    throw AppError("invalid_device_code", "argv[9] must be a decimal device code from 0 to 255");
+  }
+  if (consumed != value.size() || parsed > 255U) {
+    throw AppError("invalid_device_code", "argv[9] must be a decimal device code from 0 to 255");
+  }
+  return static_cast<std::uint8_t>(parsed);
+}
+
+std::uint32_t to_little_endian(std::uint32_t value) {
+  const std::uint16_t probe = 1;
+  if (*reinterpret_cast<const std::uint8_t*>(&probe) == 1U) {
+    return value;
+  }
+  return ((value & 0x000000FFU) << 24U) | ((value & 0x0000FF00U) << 8U) |
+         ((value & 0x00FF0000U) >> 8U) | ((value & 0xFF000000U) >> 24U);
+}
+
+class TelemetryReporter {
+ public:
+  TelemetryReporter(std::string server_path, std::uint8_t device_code)
+      : server_path_(std::move(server_path)), device_code_(device_code) {}
+
+  TelemetryReporter(const TelemetryReporter&) = delete;
+  TelemetryReporter& operator=(const TelemetryReporter&) = delete;
+
+  ~TelemetryReporter() {
+    stop_worker();
+    close_socket();
+  }
+
+  void start() {
+    if (server_path_.empty()) {
+      std::cerr << "warning: telemetry socket path (argv[8]) is empty; telemetry disabled\n";
+      return;
+    }
+    worker_ = std::thread([this] { run(); });
+  }
+
+  void finish(TelemetryStatus status) {
+    stop_worker();
+    if (!server_path_.empty()) {
+      send_status(status);
+    }
+    close_socket();
+  }
+
+ private:
+  void run() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!stopping_) {
+      lock.unlock();
+      send_status(TelemetryStatus::kRunning);
+      lock.lock();
+      wakeup_.wait_for(lock, std::chrono::milliseconds(kTelemetryIntervalMs),
+                       [this] { return stopping_; });
+    }
+  }
+
+  void stop_worker() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    wakeup_.notify_all();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+  void close_socket() {
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    if (socket_fd_ >= 0) {
+      close(socket_fd_);
+      socket_fd_ = -1;
+    }
+  }
+
+  bool connect_socket() {
+    if (server_path_.size() >= sizeof(sockaddr_un::sun_path)) {
+      std::cerr << "warning: telemetry socket path is too long: " << server_path_ << '\n';
+      return false;
+    }
+    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+      std::cerr << "warning: cannot create telemetry socket: " << std::strerror(errno) << '\n';
+      return false;
+    }
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+      std::cerr << "warning: cannot configure telemetry socket: " << std::strerror(errno) << '\n';
+      close(fd);
+      return false;
+    }
+
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, server_path_.c_str(), server_path_.size() + 1U);
+    const socklen_t address_length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                                            server_path_.size() + 1U);
+    if (connect(fd, reinterpret_cast<const sockaddr*>(&address), address_length) != 0) {
+      if (errno != EINPROGRESS) {
+        std::cerr << "warning: cannot connect telemetry socket " << server_path_ << ": "
+                  << std::strerror(errno) << '\n';
+        close(fd);
+        return false;
+      }
+      pollfd descriptor{fd, POLLOUT, 0};
+      const int poll_result = poll(&descriptor, 1, kTelemetryIoTimeoutMs);
+      int socket_error = 0;
+      socklen_t socket_error_size = sizeof(socket_error);
+      if (poll_result <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                                         &socket_error_size) != 0 || socket_error != 0) {
+        std::cerr << "warning: telemetry socket connection timed out or failed\n";
+        close(fd);
+        return false;
+      }
+    }
+    socket_fd_ = fd;
+    return true;
+  }
+
+  bool send_status(TelemetryStatus status) {
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    if (socket_fd_ < 0 && !connect_socket()) {
+      return false;
+    }
+    InnerTeleFrame frame{};
+    frame.source_device = device_code_;
+    frame.cmd = 0x00;
+    frame.length_le = to_little_endian(1U);
+    frame.data[0] = static_cast<std::uint8_t>(status);
+
+    std::size_t offset = 0;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(kTelemetryIoTimeoutMs);
+    while (offset < sizeof(frame)) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        std::cerr << "warning: telemetry frame send timed out\n";
+        close(socket_fd_);
+        socket_fd_ = -1;
+        return false;
+      }
+      const int timeout = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - now).count());
+      pollfd descriptor{socket_fd_, POLLOUT, 0};
+      if (poll(&descriptor, 1, std::max(1, timeout)) <= 0 ||
+          (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        std::cerr << "warning: telemetry socket became unavailable\n";
+        close(socket_fd_);
+        socket_fd_ = -1;
+        return false;
+      }
+      const auto* bytes = reinterpret_cast<const std::uint8_t*>(&frame);
+      const ssize_t sent = send(socket_fd_, bytes + offset, sizeof(frame) - offset, MSG_NOSIGNAL);
+      if (sent > 0) {
+        offset += static_cast<std::size_t>(sent);
+      } else if (sent < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+        continue;
+      } else {
+        std::cerr << "warning: telemetry frame send failed: " << std::strerror(errno) << '\n';
+        close(socket_fd_);
+        socket_fd_ = -1;
+        return false;
+      }
+    }
+    return true;
+  }
+
+  std::string server_path_;
+  std::uint8_t device_code_;
+  int socket_fd_ = -1;
+  std::mutex mutex_;
+  std::mutex socket_mutex_;
+  std::condition_variable wakeup_;
+  bool stopping_ = false;
+  std::thread worker_;
 };
 
 std::string trim(std::string value) {
@@ -645,8 +863,10 @@ void docker_start(const Config& config, const std::string& container) {
 
 void docker_stop(const Config& config, const std::string& container) {
   try {
-    const CommandResult result =
-        run_command({config.docker_path, "stop", "--time", "5", container}, 7000, true);
+    const bool cancelling = g_stop_requested != 0;
+    const CommandResult result = run_command(
+        {config.docker_path, "stop", "--time", cancelling ? "1" : "5", container},
+        cancelling ? 2000 : 7000, true);
     if (result.exit_code != 0) {
       std::cerr << "warning: cannot stop " << container << ": " << result.output << '\n';
     }
@@ -949,6 +1169,7 @@ int run(int argc, char* argv[]) {
   std::string mode = "unknown";
   std::optional<std::string> input;
   unsigned int preset_id = 0;
+  std::unique_ptr<TelemetryReporter> telemetry;
 
   try {
     const std::string mode_argument = argv[1];
@@ -961,9 +1182,12 @@ int run(int argc, char* argv[]) {
     }
 
     preset_id = parse_preset_index(argv[2]);
+    const std::uint8_t device_code = parse_device_code(argv[9]);
     const Config config = load_config(work_dir / "lib" / "app_1.conf");
     std::cout << "starting mode=" << mode << " agent=" << config.agent_base_url
               << " preset_id=" << preset_id << " device_code=" << argv[9] << '\n';
+    telemetry = std::make_unique<TelemetryReporter>(argv[8], device_code);
+    telemetry->start();
     AgentResult result;
     {
       BackendLifecycle backends(config);
@@ -987,6 +1211,7 @@ int run(int argc, char* argv[]) {
       }
     }
     write_result(result_path, make_success_json(mode, preset_id, input, result));
+    telemetry->finish(TelemetryStatus::kSuccess);
     std::cout << "completed mode=" << mode << " result=" << result_path << '\n';
     return 0;
   } catch (const AppError& error) {
@@ -997,9 +1222,16 @@ int run(int argc, char* argv[]) {
     } catch (const AppError& write_error) {
       std::cerr << "failed to write error result: " << write_error.what() << '\n';
     }
+    if (telemetry) {
+      telemetry->finish(error.code == "cancelled" ? TelemetryStatus::kCancelled
+                                                   : TelemetryStatus::kFailure);
+    }
     return error.code == "cancelled" ? 143 : 1;
   } catch (const std::exception& error) {
     std::cerr << "unexpected failure: " << error.what() << '\n';
+    if (telemetry) {
+      telemetry->finish(TelemetryStatus::kFailure);
+    }
     return 1;
   }
 }
