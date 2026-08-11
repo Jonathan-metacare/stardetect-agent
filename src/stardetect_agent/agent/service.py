@@ -7,6 +7,7 @@ from langchain_openai import ChatOpenAI
 from openai import APIConnectionError, APIStatusError
 
 from stardetect_agent.config import get_settings
+from stardetect_agent.observability import TaskLLMCallback, log_event
 from stardetect_agent.system.tools import build_system_tools
 
 SYSTEM_PROMPT = """You are an operations assistant for an openEuler system with
@@ -55,7 +56,9 @@ class AgentService:
             system_prompt=SYSTEM_PROMPT,
         )
 
-    def invoke(self, message: str, image_url: str | None = None) -> dict[str, Any]:
+    def invoke(
+        self, message: str, image_url: str | None = None, *, task_id: str = "unscoped"
+    ) -> dict[str, Any]:
         content: str | list[dict[str, object]] = message
         if image_url is not None:
             content = [
@@ -63,13 +66,18 @@ class AgentService:
                 {"type": "image_url", "image_url": {"url": image_url}},
             ]
         try:
-            result = self._agent.invoke({"messages": [{"role": "user", "content": content}]})
+            result = self._agent.invoke(
+                {"messages": [{"role": "user", "content": content}]},
+                config={"callbacks": [TaskLLMCallback(task_id, self._llm_model)]},
+            )
         except APIConnectionError as exc:
+            log_event("llm_workflow_failed", task_id=task_id, error_code="llm_connection_failed")
             raise AgentUpstreamError(
                 "llm_connection_failed",
                 f"Cannot connect to LLM endpoint {self._llm_base_url}",
             ) from exc
         except APIStatusError as exc:
+            log_event("llm_workflow_failed", task_id=task_id, error_code="llm_request_failed")
             raise AgentUpstreamError(
                 "llm_request_failed",
                 (
@@ -77,9 +85,24 @@ class AgentService:
                     f"{exc.status_code}: {exc.message}"
                 ),
             ) from exc
+        except Exception as exc:
+            log_event(
+                "llm_workflow_failed",
+                task_id=task_id,
+                error_code="llm_unexpected_error",
+                error_type=type(exc).__name__,
+            )
+            raise
         messages = result.get("messages", [])
         answer = _last_ai_content(messages)
-        return {"answer": answer, "tool_calls": _collect_tool_calls(messages)}
+        tool_calls = _collect_tool_calls(messages)
+        log_event(
+            "tool_calls",
+            task_id=task_id,
+            count=len(tool_calls),
+            tools=[call.get("name") for call in tool_calls],
+        )
+        return {"answer": answer, "tool_calls": tool_calls}
 
 
 def _last_ai_content(messages: list[Any]) -> str:

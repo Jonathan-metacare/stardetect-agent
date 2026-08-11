@@ -1,3 +1,5 @@
+import logging
+
 from fastapi.testclient import TestClient
 
 from stardetect_agent.agent.service import AgentUpstreamError, get_agent_service
@@ -18,7 +20,9 @@ class FakeProvider:
 
 
 class FakeAgentService:
-    def invoke(self, message: str, image_url: str | None = None) -> dict[str, object]:
+    def invoke(
+        self, message: str, image_url: str | None = None, *, task_id: str = "unscoped"
+    ) -> dict[str, object]:
         return {
             "answer": f"mock answer: {message}; image={image_url}",
             "tool_calls": [{"name": "get_system_snapshot", "args": {}, "id": "mock"}],
@@ -26,7 +30,9 @@ class FakeAgentService:
 
 
 class FailingAgentService:
-    def invoke(self, message: str, image_url: str | None = None) -> dict[str, object]:
+    def invoke(
+        self, message: str, image_url: str | None = None, *, task_id: str = "unscoped"
+    ) -> dict[str, object]:
         raise AgentUpstreamError(
             "llm_connection_failed",
             "Cannot connect to LLM endpoint http://llm-vl:8000/v1",
@@ -78,6 +84,40 @@ def test_chat_endpoint_with_mock_agent() -> None:
     assert response.status_code == 200
     assert response.json()["answer"] == "mock answer: GPU 温度是多少？; image=None"
     assert response.json()["tool_calls"][0]["name"] == "get_system_snapshot"
+
+
+def test_chat_endpoint_forwards_safe_task_id() -> None:
+    app.dependency_overrides[get_agent_service] = lambda: FakeAgentService()
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/chat",
+        headers={"X-SpaceZenith-Task-ID": "20260810T120000Z-123"},
+        json={"message": "hello"},
+    )
+
+    app.dependency_overrides.clear()
+    assert response.status_code == 200
+    assert response.headers["X-SpaceZenith-Task-ID"] == "20260810T120000Z-123"
+
+
+def test_chat_audit_log_does_not_contain_message_or_image_url(caplog: object) -> None:
+    app.dependency_overrides[get_agent_service] = lambda: FakeAgentService()
+    client = TestClient(app)
+    caplog.set_level(logging.INFO, logger="stardetect_agent.audit")  # type: ignore[attr-defined]
+
+    response = client.post(
+        "/api/chat",
+        headers={"X-SpaceZenith-Task-ID": "task-safe"},
+        json={"message": "private prompt text", "image_url": "https://example.com/private.png"},
+    )
+
+    app.dependency_overrides.clear()
+    assert response.status_code == 200
+    rendered = caplog.text  # type: ignore[attr-defined]
+    assert "private prompt text" not in rendered
+    assert "https://example.com/private.png" not in rendered
+    assert '"has_image":true' in rendered
 
 
 def test_chat_endpoint_accepts_image_url() -> None:

@@ -54,6 +54,10 @@ struct Config {
   std::string agent_health_url = "http://127.0.0.1:8001/health";
   int backend_start_timeout_ms = 180000;
   int backend_poll_interval_ms = 1000;
+  int backend_log_tail_lines = 500;
+  std::size_t backend_log_max_bytes = 2U * 1024U * 1024U;
+  std::size_t task_log_max_bytes = 8U * 1024U * 1024U;
+  int task_log_keep_count = 255;
 };
 
 struct Endpoint {
@@ -72,6 +76,141 @@ struct AppError : std::runtime_error {
 
   AppError(std::string error_code, const std::string& message)
       : std::runtime_error(message), code(std::move(error_code)) {}
+};
+
+std::string make_task_id() {
+  const std::time_t now = std::time(nullptr);
+  std::tm utc{};
+  gmtime_r(&now, &utc);
+  std::ostringstream stream;
+  stream << std::put_time(&utc, "%Y%m%dT%H%M%SZ") << "-" << getpid();
+  return stream.str();
+}
+
+struct TaskLogLimit {
+  explicit TaskLogLimit(std::size_t value) : max_bytes(value) {}
+  std::size_t max_bytes;
+  std::size_t written = 0;
+  bool truncated = false;
+};
+
+class TeeStreambuf final : public std::streambuf {
+ public:
+  TeeStreambuf(std::streambuf* primary, std::streambuf* file, std::shared_ptr<TaskLogLimit> limit)
+      : primary_(primary), file_(file), limit_(std::move(limit)) {}
+
+ protected:
+  int overflow(int character) override {
+    if (character != traits_type::eof()) {
+      const char value = static_cast<char>(character);
+      write(&value, 1U);
+    }
+    return character;
+  }
+
+  std::streamsize xsputn(const char* data, std::streamsize count) override {
+    if (count > 0) {
+      write(data, static_cast<std::size_t>(count));
+    }
+    return count;
+  }
+
+  int sync() override {
+    return primary_->pubsync() == 0 && file_->pubsync() == 0 ? 0 : -1;
+  }
+
+ private:
+  void write(const char* data, std::size_t count) {
+    constexpr std::string_view marker = "[APP task log truncated at configured size limit]\n";
+    primary_->sputn(data, static_cast<std::streamsize>(count));
+    const std::size_t payload_limit = limit_->max_bytes > marker.size()
+                                          ? limit_->max_bytes - marker.size()
+                                          : 0U;
+    if (limit_->written < payload_limit) {
+      const std::size_t allowed = std::min(count, payload_limit - limit_->written);
+      file_->sputn(data, static_cast<std::streamsize>(allowed));
+      limit_->written += allowed;
+    }
+    if ((count > 0 && limit_->written >= payload_limit) && !limit_->truncated) {
+      file_->sputn(marker.data(), static_cast<std::streamsize>(marker.size()));
+      limit_->written += marker.size();
+      primary_->sputn(marker.data(), static_cast<std::streamsize>(marker.size()));
+      limit_->truncated = true;
+    }
+  }
+
+  std::streambuf* primary_;
+  std::streambuf* file_;
+  std::shared_ptr<TaskLogLimit> limit_;
+};
+
+class TaskLog final {
+ public:
+  TaskLog(const std::filesystem::path& log_dir, const std::string& task_id,
+          std::size_t max_bytes, int keep_count)
+      : path_(log_dir / ("spacezenith-" + task_id + ".log")) {
+    std::error_code error;
+    std::filesystem::create_directories(log_dir, error);
+    if (error) {
+      throw AppError("task_log_directory_failed", "cannot create task log directory: " + error.message());
+    }
+    prune(log_dir, keep_count);
+    file_.open(path_, std::ios::binary | std::ios::trunc);
+    if (!file_) {
+      throw AppError("task_log_open_failed", "cannot create task log file: " + path_.string());
+    }
+    limit_ = std::make_shared<TaskLogLimit>(max_bytes);
+    out_tee_ = std::make_unique<TeeStreambuf>(std::cout.rdbuf(), file_.rdbuf(), limit_);
+    err_tee_ = std::make_unique<TeeStreambuf>(std::cerr.rdbuf(), file_.rdbuf(), limit_);
+    original_out_ = std::cout.rdbuf(out_tee_.get());
+    original_err_ = std::cerr.rdbuf(err_tee_.get());
+  }
+
+  ~TaskLog() {
+    std::cout.flush();
+    std::cerr.flush();
+    if (original_out_ != nullptr) std::cout.rdbuf(original_out_);
+    if (original_err_ != nullptr) std::cerr.rdbuf(original_err_);
+    file_.flush();
+  }
+
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  static void prune(const std::filesystem::path& log_dir, int keep_count) {
+    std::vector<std::filesystem::directory_entry> files;
+    for (const auto& entry : std::filesystem::directory_iterator(log_dir)) {
+      const std::string name = entry.path().filename().string();
+      if (entry.is_regular_file() && name.rfind("spacezenith-", 0) == 0 &&
+          entry.path().extension() == ".log") {
+        files.push_back(entry);
+      }
+    }
+    std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
+      std::error_code left_error;
+      std::error_code right_error;
+      const auto left_time = left.last_write_time(left_error);
+      const auto right_time = right.last_write_time(right_error);
+      if (!left_error && !right_error && left_time != right_time) return left_time < right_time;
+      return left.path().filename().string() < right.path().filename().string();
+    });
+    while (static_cast<int>(files.size()) >= keep_count) {
+      std::error_code error;
+      std::filesystem::remove(files.front().path(), error);
+      if (error) {
+        throw AppError("task_log_prune_failed", "cannot remove old task log: " + error.message());
+      }
+      files.erase(files.begin());
+    }
+  }
+
+  std::filesystem::path path_;
+  std::ofstream file_;
+  std::shared_ptr<TaskLogLimit> limit_;
+  std::unique_ptr<TeeStreambuf> out_tee_;
+  std::unique_ptr<TeeStreambuf> err_tee_;
+  std::streambuf* original_out_ = nullptr;
+  std::streambuf* original_err_ = nullptr;
 };
 
 constexpr std::size_t kTelemetryFrameSize = 1066U;
@@ -357,6 +496,14 @@ Config load_config(const std::filesystem::path& path) {
       config.backend_start_timeout_ms = parse_positive_int(value, key);
     } else if (key == "backend_poll_interval_ms") {
       config.backend_poll_interval_ms = parse_positive_int(value, key);
+    } else if (key == "backend_log_tail_lines") {
+      config.backend_log_tail_lines = parse_positive_int(value, key);
+    } else if (key == "backend_log_max_bytes") {
+      config.backend_log_max_bytes = static_cast<std::size_t>(parse_positive_int(value, key));
+    } else if (key == "task_log_max_bytes") {
+      config.task_log_max_bytes = static_cast<std::size_t>(parse_positive_int(value, key));
+    } else if (key == "task_log_keep_count") {
+      config.task_log_keep_count = parse_positive_int(value, key);
     } else {
       throw AppError("invalid_config", "unknown config key: " + key);
     }
@@ -364,6 +511,9 @@ Config load_config(const std::filesystem::path& path) {
   if (config.docker_path.empty() || config.llm_container.empty() || config.agent_container.empty() ||
       config.llm_health_url.empty() || config.agent_health_url.empty()) {
     throw AppError("invalid_config", "backend container configuration must not be empty");
+  }
+  if (config.task_log_max_bytes < 1024U) {
+    throw AppError("invalid_config", "task_log_max_bytes must be at least 1024");
   }
   return config;
 }
@@ -646,7 +796,7 @@ void send_all(int socket_fd, const std::string& data,
   }
 }
 
-HttpResponse post_json(const Config& config, const std::string& body) {
+HttpResponse post_json(const Config& config, const std::string& body, const std::string& task_id) {
   const Endpoint endpoint = parse_endpoint(config.agent_base_url);
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(config.request_timeout_ms);
@@ -656,6 +806,7 @@ HttpResponse post_json(const Config& config, const std::string& body) {
     const std::string request = "POST " + path + " HTTP/1.1\r\nHost: " + endpoint.host +
                                 "\r\nContent-Type: application/json\r\nContent-Length: " +
                                 std::to_string(body.size()) +
+                                "\r\nX-SpaceZenith-Task-ID: " + task_id +
                                 "\r\nConnection: close\r\n\r\n" + body;
     send_all(socket_fd, request, deadline);
 
@@ -750,10 +901,12 @@ HttpResponse get_http(const Config& config, const std::string& url) {
 struct CommandResult {
   int exit_code;
   std::string output;
+  bool output_truncated;
 };
 
 CommandResult run_command(const std::vector<std::string>& arguments, int timeout_ms,
-                          bool ignore_stop_request = false) {
+                          bool ignore_stop_request = false,
+                          std::size_t max_output_bytes = std::numeric_limits<std::size_t>::max()) {
   if (arguments.empty()) {
     throw AppError("backend_docker_failed", "empty command");
   }
@@ -788,6 +941,19 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
     fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK);
   }
   std::string output;
+  bool output_truncated = false;
+  const auto append_output = [&output, &output_truncated, max_output_bytes](const char* data,
+                                                                              std::size_t size) {
+    const std::size_t remaining = max_output_bytes > output.size() ? max_output_bytes - output.size()
+                                                                    : 0U;
+    const std::size_t accepted = std::min(size, remaining);
+    if (accepted > 0) {
+      output.append(data, accepted);
+    }
+    if (accepted < size) {
+      output_truncated = true;
+    }
+  };
   std::array<char, 1024> buffer{};
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
   int wait_status = 0;
@@ -796,7 +962,7 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
     while (true) {
       const ssize_t received = read(output_pipe[0], buffer.data(), buffer.size());
       if (received > 0) {
-        output.append(buffer.data(), static_cast<std::size_t>(received));
+        append_output(buffer.data(), static_cast<std::size_t>(received));
       } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
         break;
       } else {
@@ -827,14 +993,14 @@ CommandResult run_command(const std::vector<std::string>& arguments, int timeout
   while (true) {
     const ssize_t received = read(output_pipe[0], buffer.data(), buffer.size());
     if (received > 0) {
-      output.append(buffer.data(), static_cast<std::size_t>(received));
+      append_output(buffer.data(), static_cast<std::size_t>(received));
     } else {
       break;
     }
   }
   close(output_pipe[0]);
   const int exit_code = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : 128;
-  return {exit_code, trim(output)};
+  return {exit_code, trim(output), output_truncated};
 }
 
 bool docker_is_running(const Config& config, const std::string& container) {
@@ -875,6 +1041,29 @@ void docker_stop(const Config& config, const std::string& container) {
   }
 }
 
+void docker_dump_logs(const Config& config, const std::string& container,
+                      const std::string& task_started_at) {
+  try {
+    const CommandResult result = run_command(
+        {config.docker_path, "logs", "--timestamps", "--since", task_started_at, "--tail",
+         std::to_string(config.backend_log_tail_lines), container},
+        10000, true, config.backend_log_max_bytes);
+    std::cout << "--- container logs: " << container << " (since " << task_started_at << ") ---\n";
+    if (result.exit_code != 0) {
+      std::cout << "docker logs failed: " << result.output << '\n';
+      return;
+    }
+    if (!result.output.empty()) {
+      std::cout << result.output << '\n';
+    }
+    if (result.output_truncated) {
+      std::cout << "[container logs truncated at " << config.backend_log_max_bytes << " bytes]\n";
+    }
+  } catch (const AppError& error) {
+    std::cout << "--- container logs: " << container << " unavailable: " << error.what() << " ---\n";
+  }
+}
+
 void wait_for_healthy(const Config& config, const std::string& name, const std::string& health_url) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(config.backend_start_timeout_ms);
@@ -896,9 +1085,12 @@ void wait_for_healthy(const Config& config, const std::string& name, const std::
   throw AppError("backend_not_ready", name + " did not become ready: " + last_error);
 }
 
+std::string timestamp_utc();
+
 class BackendLifecycle {
  public:
-  explicit BackendLifecycle(const Config& config) : config_(config) {}
+  BackendLifecycle(const Config& config, std::string task_started_at)
+      : config_(config), task_started_at_(std::move(task_started_at)) {}
 
   void start() {
     start_if_needed(config_.llm_container, config_.llm_health_url, llm_started_);
@@ -909,9 +1101,11 @@ class BackendLifecycle {
     if (agent_started_) {
       docker_stop(config_, config_.agent_container);
     }
+    docker_dump_logs(config_, config_.agent_container, task_started_at_);
     if (llm_started_) {
       docker_stop(config_, config_.llm_container);
     }
+    docker_dump_logs(config_, config_.llm_container, task_started_at_);
   }
 
  private:
@@ -928,6 +1122,7 @@ class BackendLifecycle {
   }
 
   const Config& config_;
+  std::string task_started_at_;
   bool llm_started_ = false;
   bool agent_started_ = false;
 };
@@ -1128,7 +1323,8 @@ void write_result(const std::filesystem::path& path, const std::string& content)
 }
 
 std::string make_success_json(const std::string& mode, unsigned int preset_id,
-                              const std::optional<std::string>& input, const AgentResult& result) {
+                              const std::optional<std::string>& input, const AgentResult& result,
+                              const std::string& task_id) {
   std::ostringstream output;
   output << "{\"mode\":\"" << json_escape(mode) << "\",\"input\":";
   if (input) {
@@ -1137,13 +1333,15 @@ std::string make_success_json(const std::string& mode, unsigned int preset_id,
   } else {
     output << "null";
   }
-  output << ",\"answer\":\"" << json_escape(result.answer) << "\",\"tool_calls\":"
+  output << ",\"task_id\":\"" << json_escape(task_id) << "\",\"answer\":\""
+         << json_escape(result.answer) << "\",\"tool_calls\":"
          << result.tool_calls << ",\"timestamp\":\"" << timestamp_utc() << "\"}";
   return output.str();
 }
 
 std::string make_error_json(const std::string& mode, unsigned int preset_id,
-                            const std::optional<std::string>& input, const AppError& error) {
+                            const std::optional<std::string>& input, const AppError& error,
+                            const std::string& task_id) {
   std::ostringstream output;
   output << "{\"mode\":\"" << json_escape(mode) << "\",\"input\":";
   if (input) {
@@ -1152,7 +1350,8 @@ std::string make_error_json(const std::string& mode, unsigned int preset_id,
   } else {
     output << "null";
   }
-  output << ",\"answer\":\"\",\"tool_calls\":[],\"timestamp\":\"" << timestamp_utc()
+  output << ",\"task_id\":\"" << json_escape(task_id)
+         << "\",\"answer\":\"\",\"tool_calls\":[],\"timestamp\":\"" << timestamp_utc()
          << "\",\"error\":{\"code\":\"" << json_escape(error.code)
          << "\",\"message\":\"" << json_escape(error.what()) << "\"}}";
   return output.str();
@@ -1170,6 +1369,8 @@ int run(int argc, char* argv[]) {
   std::optional<std::string> input;
   unsigned int preset_id = 0;
   std::unique_ptr<TelemetryReporter> telemetry;
+  std::string task_id = "unscoped";
+  std::unique_ptr<TaskLog> task_log;
 
   try {
     const std::string mode_argument = argv[1];
@@ -1184,13 +1385,25 @@ int run(int argc, char* argv[]) {
     preset_id = parse_preset_index(argv[2]);
     const std::uint8_t device_code = parse_device_code(argv[9]);
     const Config config = load_config(work_dir / "lib" / "app_1.conf");
+    task_id = make_task_id();
+    try {
+      task_log = std::make_unique<TaskLog>(work_dir / "log", task_id, config.task_log_max_bytes,
+                                           config.task_log_keep_count);
+    } catch (const AppError& error) {
+      write_result(result_path, make_error_json(mode, preset_id, input, error, task_id));
+      std::cerr << "failed to initialize task log: " << error.what() << '\n';
+      return 1;
+    }
+    const std::string task_started_at = timestamp_utc();
+    std::cout << "APP task_started task_id=" << task_id << " mode=" << mode
+              << " preset_id=" << preset_id << " task_log=" << task_log->path() << '\n';
     std::cout << "starting mode=" << mode << " agent=" << config.agent_base_url
               << " preset_id=" << preset_id << " device_code=" << argv[9] << '\n';
     telemetry = std::make_unique<TelemetryReporter>(argv[8], device_code);
     telemetry->start();
     AgentResult result;
     {
-      BackendLifecycle backends(config);
+      BackendLifecycle backends(config, task_started_at);
       backends.start();
       if (mode == "image_recognition") {
         const std::filesystem::path image_path = select_image_preset(raw_dir, preset_id);
@@ -1200,28 +1413,31 @@ int run(int argc, char* argv[]) {
         const std::string request =
             "{\"message\":\"请识别并简洁描述这张图片中的主要内容、关键对象和异常或重要信息。"
             "仅基于图像回答。\",\"image_url\":\"" + json_escape(data_url) + "\"}";
-        result = parse_agent_result(post_json(config, request), false);
+        result = parse_agent_result(post_json(config, request, task_id), false);
       } else {
         std::filesystem::path prompt_path;
         const std::string prompt =
             read_prompt(raw_dir, preset_id, config.max_prompt_bytes, prompt_path);
         input = prompt_path.string();
         const std::string request = "{\"message\":\"" + json_escape(prompt) + "\"}";
-        result = parse_agent_result(post_json(config, request), false);
+        result = parse_agent_result(post_json(config, request, task_id), false);
       }
     }
-    write_result(result_path, make_success_json(mode, preset_id, input, result));
+    write_result(result_path, make_success_json(mode, preset_id, input, result, task_id));
     telemetry->finish(TelemetryStatus::kSuccess);
-    std::cout << "completed mode=" << mode << " result=" << result_path << '\n';
+    std::cout << "APP task_completed task_id=" << task_id << " result=success path=" << result_path
+              << '\n';
     return 0;
   } catch (const AppError& error) {
     std::cerr << "failed mode=" << mode << " code=" << error.code << " message=" << error.what()
               << '\n';
     try {
-      write_result(result_path, make_error_json(mode, preset_id, input, error));
+      write_result(result_path, make_error_json(mode, preset_id, input, error, task_id));
     } catch (const AppError& write_error) {
       std::cerr << "failed to write error result: " << write_error.what() << '\n';
     }
+    std::cout << "APP task_completed task_id=" << task_id << " result=failed code=" << error.code
+              << '\n';
     if (telemetry) {
       telemetry->finish(error.code == "cancelled" ? TelemetryStatus::kCancelled
                                                    : TelemetryStatus::kFailure);

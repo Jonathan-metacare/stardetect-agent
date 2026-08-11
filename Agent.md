@@ -187,8 +187,10 @@ docker run -d \
       --limit-mm-per-prompt "{\"image\":1,\"video\":0}" \
       --mm-processor-kwargs "{\"min_pixels\":262144,\"max_pixels\":1310720}" \
       --compilation-config "{\"custom_ops\":[\"all\",\"-rotary_embedding\"]}" \
+      --enable-log-requests \
       --enable-auto-tool-choice \
-      --tool-call-parser hermes
+      --tool-call-parser hermes \
+      --uvicorn-log-level info
   '
 ```
 
@@ -199,9 +201,15 @@ keeps one image within the 4096-token context limit.
 Check readiness:
 
 ```bash
+docker exec llm-qwen3-vl sh -lc 'vllm serve --help | grep -F -- --enable-log-requests'
 docker logs -f llm-qwen3-vl
 curl http://127.0.0.1:8003/v1/models
 ```
+
+`--enable-log-requests` keeps vLLM at INFO-level request metadata logging. Do not switch this
+container to DEBUG logging or enable prompt/output logging: task content is intentionally kept out
+of the archived logs. The Agent writes its own metadata-only JSON Lines events to stdout, including
+the `X-SpaceZenith-Task-ID` received from the APP, model-call durations, token usage and tools.
 
 ## 4. Create the shared network on the server
 

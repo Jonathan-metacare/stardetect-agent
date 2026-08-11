@@ -65,7 +65,9 @@ class MockTelemetryServer:
             while sum(frame[6] == status for frame in self.frames) < count:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise AssertionError(f"did not receive telemetry status {status:#x}: {self.frames!r}")
+                    raise AssertionError(
+                        f"did not receive telemetry status {status:#x}: {self.frames!r}"
+                    )
                 self._condition.wait(remaining)
             return list(self.frames)
 
@@ -85,7 +87,12 @@ class MockAgentHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers["Content-Length"])
-        self.__class__.requests.append(json.loads(self.rfile.read(length)))
+        self.__class__.requests.append(
+            {
+                "body": json.loads(self.rfile.read(length)),
+                "task_id": self.headers.get("X-SpaceZenith-Task-ID"),
+            }
+        )
         if self.__class__.response_delay_seconds:
             time.sleep(self.__class__.response_delay_seconds)
         body = json.dumps(self.__class__.response_body).encode()
@@ -151,6 +158,7 @@ class AppIntegrationTests(unittest.TestCase):
             "  inspect) cat \"$state_dir/$4\" ;;\n"
             "  start) echo true > \"$state_dir/$2\" ;;\n"
             "  stop) echo false > \"$state_dir/$4\" ;;\n"
+            "  logs) printf 'fake %s runtime log\\n' \"$7\" ;;\n"
             "esac\n",
             encoding="utf-8",
         )
@@ -208,7 +216,7 @@ class AppIntegrationTests(unittest.TestCase):
         MockAgentHandler.response_body = {"answer": "识别到测试图像", "tool_calls": []}
         completed = self.run_app("1")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        request = MockAgentHandler.requests[0]
+        request = MockAgentHandler.requests[0]["body"]
         self.assertIn("image_url", request)
         self.assertTrue(str(request["image_url"]).startswith("data:image/jpeg;base64,"))
         result = json.loads(self.result.read_text(encoding="utf-8"))
@@ -233,7 +241,8 @@ class AppIntegrationTests(unittest.TestCase):
         (self.raw_dir / "image2.png").write_bytes(b"\x89PNG\r\n\x1a\nminimal")
         completed = self.run_app("1", "2")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertTrue(str(MockAgentHandler.requests[0]["image_url"]).startswith("data:image/png;"))
+        body = MockAgentHandler.requests[0]["body"]
+        self.assertTrue(str(body["image_url"]).startswith("data:image/png;"))
 
     def test_text_prompt_reads_selected_raw_file(self) -> None:
         MockAgentHandler.response_body = {
@@ -242,7 +251,7 @@ class AppIntegrationTests(unittest.TestCase):
         }
         completed = self.run_app("2", "2")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        request = MockAgentHandler.requests[0]
+        request = MockAgentHandler.requests[0]["body"]
         self.assertNotIn("image_url", request)
         self.assertEqual(
             request["message"],
@@ -253,21 +262,41 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual(result["input"]["preset_id"], 2)
         self.assertEqual(result["tool_calls"][0]["name"], "get_gpu_status")
 
+    def test_task_log_collects_stdout_docker_logs_and_header(self) -> None:
+        completed = self.run_app("2", "1")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        task_id = MockAgentHandler.requests[0]["task_id"]
+        self.assertRegex(str(task_id), r"^\d{8}T\d{6}Z-\d+$")
+        logs = list((self.work_dir / "log").glob("spacezenith-*.log"))
+        self.assertEqual(len(logs), 1)
+        text = logs[0].read_text(encoding="utf-8")
+        self.assertIn(f"APP task_started task_id={task_id}", text)
+        self.assertIn("fake stardetect-agent runtime log", text)
+        self.assertIn("fake llm-qwen3-vl runtime log", text)
+        self.assertIn("APP task_completed", text)
+        self.assertIn("fake stardetect-agent runtime log", completed.stdout)
+
     def test_only_stops_backends_started_by_this_task(self) -> None:
         completed = self.run_app("2", "1")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         commands = self.docker_log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(
-            commands,
+            commands[:5],
             [
                 "inspect --format {{.State.Running}} llm-qwen3-vl",
                 "start llm-qwen3-vl",
                 "inspect --format {{.State.Running}} stardetect-agent",
                 "start stardetect-agent",
                 "stop --time 5 stardetect-agent",
-                "stop --time 5 llm-qwen3-vl",
             ],
         )
+        self.assertTrue(commands[5].startswith("logs --timestamps --since "))
+        self.assertTrue(commands[5].endswith(" --tail 500 stardetect-agent"))
+        self.assertEqual(commands[6], "stop --time 5 llm-qwen3-vl")
+        self.assertTrue(commands[7].startswith("logs --timestamps --since "))
+        self.assertTrue(commands[7].endswith(" --tail 500 llm-qwen3-vl"))
+        self.assertIn("fake stardetect-agent runtime log", completed.stdout)
+        self.assertIn("fake llm-qwen3-vl runtime log", completed.stdout)
 
     def test_does_not_stop_preexisting_backends(self) -> None:
         for container in ("llm-qwen3-vl", "stardetect-agent"):
@@ -276,12 +305,15 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         commands = self.docker_log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(
-            commands,
+            commands[:2],
             [
                 "inspect --format {{.State.Running}} llm-qwen3-vl",
                 "inspect --format {{.State.Running}} stardetect-agent",
             ],
         )
+        self.assertEqual(len(commands), 4)
+        self.assertTrue(commands[2].endswith(" --tail 500 stardetect-agent"))
+        self.assertTrue(commands[3].endswith(" --tail 500 llm-qwen3-vl"))
 
     def test_missing_preset_writes_error(self) -> None:
         completed = self.run_app("2", "3")

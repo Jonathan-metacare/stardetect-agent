@@ -64,6 +64,10 @@ llm_health_url=http://127.0.0.1:8003/v1/models
 agent_health_url=http://127.0.0.1:8001/health
 backend_start_timeout_ms=180000
 backend_poll_interval_ms=1000
+backend_log_tail_lines=500
+backend_log_max_bytes=2097152
+task_log_max_bytes=8388608
+task_log_keep_count=255
 connect_timeout_ms=3000
 request_timeout_ms=60000
 max_image_bytes=8388608
@@ -82,12 +86,26 @@ max_prompt_bytes=65536
 2. 对 `agent_container` 执行相同操作，等待 `agent_health_url` 返回 HTTP 2xx。
 3. 调用 Agent 完成图像或文字任务。
 4. 任务成功、失败或收到 `SIGTERM` 后，按 Agent、LLM 的顺序停止**本次 APP 启动的**容器。
+5. 对 Agent 和 LLM 执行 `docker logs --timestamps --since <任务开始时刻>`，并把日志输出到
+   APP 标准输出。
 
 若容器在任务开始前已经运行，APP 不会停止它。默认配置对应当前部署的
 `llm-qwen3-vl`（主机端口 8003）和 `stardetect-agent`（主机端口 8001）。
 
 运行 APP 的平台用户必须有执行 Docker CLI 的权限，通常要求为 `root` 或已加入 Docker
 socket 对应用户组；否则结果 JSON 会返回 `backend_docker_failed`。
+
+平台只需采集 APP 的 stdout/stderr：容器日志会被 APP 加上 `--- container logs: ... ---`
+分隔行后输出，因此会与 APP 自身日志一同落入 `app_1/log/`。每次任务还会直接创建
+`app_1/log/spacezenith-<UTC>-<pid>.log`，并将同样内容同步输出到 stdout/stderr，因而既可
+由平台采集也可在本地追溯。APP 会把该任务 ID 作为 `X-SpaceZenith-Task-ID` 传给 Agent；Agent
+的 JSON Lines 和容器原始日志随后会出现在同一文件。日志仅保存任务 ID、长度、耗时、token
+用量、工具名和状态等元数据，不保存 prompt 正文、图片 data URL/Base64、模型完整回答或 API key。
+`backend_log_tail_lines` 限制
+每个容器的最后日志行数，`backend_log_max_bytes` 限制每个容器转存的最大字节数；达到字节
+上限时 APP 会写入截断提示。`task_log_max_bytes` 限制整个物理任务文件，
+`task_log_keep_count` 默认只保留最新 255 个 `spacezenith-*.log`；它不会删除平台的其他日志。
+容器原本已经运行时也会转存本任务时间窗口内的日志，但不会停止。
 
 ## 结果格式
 
@@ -107,6 +125,15 @@ socket 对应用户组；否则结果 JSON 会返回 `backend_docker_failed`。
 `raw/promptN.txt` 的内容和 Agent 决定。返回的 `tool_calls` 会原样保留在结果 JSON 中。
 
 ## 本地验证
+
+如在没有星载平台 socket 服务的部署机上手工验收，可先在一个终端启动本地接收器：
+
+```bash
+python3 tools/mock_telemetry_socket.py /tmp/app1-telemetry.sock --exit-on-final
+```
+
+然后把 APP 的 `argv[8]` 传为 `/tmp/app1-telemetry.sock`。接收器会打印 `running` 以及最后的
+`success`、`failure` 或 `cancelled` 状态；按 `Ctrl-C` 也会安全删除该 socket 文件。
 
 ```bash
 python3 tests/test_app.py
